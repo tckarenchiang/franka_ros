@@ -27,14 +27,15 @@ namespace franka_gazebo {
 
 /**
  * A custom implementation of a [gazebo_ros_control](http://wiki.ros.org/gazebo_ros_control) plugin,
- * which is able to simulate franka interfaces in Gazebo.
+ * which is able to simulate franka interfaces and the boxer interface in Gazebo.
  *
  * Specifically it supports the following hardware transmission types
  *
  * ### transmission_interface/SimpleTransmission
  * - hardware_interface/JointStateInterface
  * - hardware_interface/EffortJointInterface
- *
+ * - hardware_interface/VelocityJointInterface
+
  * ### franka_hw/FrankaStateInterface
  * ### franka_hw/FrankaModelInterface
  *

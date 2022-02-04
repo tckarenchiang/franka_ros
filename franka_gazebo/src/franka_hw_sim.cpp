@@ -121,9 +121,9 @@ bool FrankaHWSim::initSim(const std::string& robot_namespace,
         }
 
         // When the hardware_interface is VelocityJointInterface
-        // Note that this part is mostly taken from the DefaultRobotHWSim
-        // and it's created only for the boxer joints (wheel_left_joint and wheel_right_joint)
-        // not for the panda arm which requires more complex mechanisms I believe
+        // NOTE: this part is mostly taken from the DefaultRobotHWSim
+        // and it's created for the support of boxer_velocity_controller
+        // as the Panda robot only has effort controlled joints
         if (k_interface == "hardware_interface/VelocityJointInterface") {
           // initVelocityCommandHandle(joint);
           joint->joint_control_method = VELOCITY;
