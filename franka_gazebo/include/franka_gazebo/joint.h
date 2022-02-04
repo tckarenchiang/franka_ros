@@ -5,7 +5,12 @@
 #include <Eigen/Dense>
 #include <gazebo/physics/Joint.hh>
 
+#include <joint_limits_interface/joint_limits.h>
+#include <control_toolbox/pid.h>
+
 namespace franka_gazebo {
+
+enum ControlMethod {EFFORT, VELOCITY, VELOCITY_PID};
 
 /**
  * A data container holding all relevant information about a robotic joint.
@@ -35,6 +40,9 @@ struct Joint {
   /// http://docs.ros.org/en/diamondback/api/urdf/html/classurdf_1_1Joint.html
   int type;
 
+  double joint_lower_limit;
+  double joint_upper_limit;
+  double joint_effort_limit;
   /// The axis of rotation/translation of this joint in local coordinates
   Eigen::Vector3d axis;
 
@@ -83,6 +91,9 @@ struct Joint {
    */
   bool isInCollision() const;
 
+  // each joint has a control method (effort or velocity)
+  ControlMethod joint_control_method;
+  control_toolbox::Pid pid_controller;
  private:
   double lastVelocity = std::numeric_limits<double>::quiet_NaN();
   double lastAcceleration = std::numeric_limits<double>::quiet_NaN();

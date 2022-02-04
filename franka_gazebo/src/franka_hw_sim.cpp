@@ -15,6 +15,8 @@
 #include <sstream>
 #include <string>
 
+#include <boost/algorithm/clamp.hpp>
+
 namespace franka_gazebo {
 
 bool FrankaHWSim::initSim(const std::string& robot_namespace,
@@ -23,6 +25,9 @@ bool FrankaHWSim::initSim(const std::string& robot_namespace,
                           const urdf::Model* const urdf,
                           std::vector<transmission_interface::TransmissionInfo> transmissions) {
   model_nh.param<std::string>("arm_id", this->arm_id_, robot_namespace);
+
+  const ros::NodeHandle joint_limit_nh(model_nh);
+
   if (this->arm_id_ != robot_namespace) {
     ROS_WARN_STREAM_NAMED(
         "franka_hw_sim",
@@ -40,7 +45,7 @@ bool FrankaHWSim::initSim(const std::string& robot_namespace,
 #endif
 
   ROS_INFO_STREAM_NAMED("franka_hw_sim", "Using physics type " << physics->GetType());
-
+  physics_type_ = physics->GetType();
   // Retrieve initial gravity vector from Gazebo
   // NOTE: Can be overwritten by the user via the 'gravity_vector' ROS parameter.
   auto gravity = physics->World()->Gravity();
@@ -111,6 +116,48 @@ bool FrankaHWSim::initSim(const std::string& robot_namespace,
                                                    << joint->name << "': " << k_interface);
         if (k_interface == "hardware_interface/EffortJointInterface") {
           initEffortCommandHandle(joint);
+          joint->joint_control_method = EFFORT;
+          continue;
+        }
+
+        // When the hardware_interface is VelocityJointInterface
+        // Note that this part is mostly taken from the DefaultRobotHWSim
+        // and it's created only for the boxer joints (wheel_left_joint and wheel_right_joint)
+        // not for the panda arm which requires more complex mechanisms I believe
+        if (k_interface == "hardware_interface/VelocityJointInterface") {
+          // initVelocityCommandHandle(joint);
+          joint->joint_control_method = VELOCITY;
+
+          hardware_interface::JointHandle joint_handle;
+          joint_handle = hardware_interface::JointHandle(this->jsi_.getHandle(joint->name), &joint->command);
+          this->vji_.registerHandle(joint_handle);
+
+          registerJointLimits(joint->name, joint_handle, joint->joint_control_method,
+                      joint_limit_nh, urdf,
+                      &joint->type, &joint->joint_lower_limit, &joint->joint_upper_limit,
+                      &joint->joint_effort_limit);
+        
+          // Initialize the PID controller. If no PID gain values are found, use joint->SetAngle() or
+          // joint->SetParam("vel") to control the joint.
+          const ros::NodeHandle nh(robot_namespace + "/gazebo_ros_control/pid_gains/" +
+                                  joint->name);
+          if (joint->pid_controller.init(nh))
+          {
+            ROS_INFO_STREAM(joint->name << "has PID gain values set");
+            joint->joint_control_method = VELOCITY_PID;
+          }
+          else
+          {
+            // joint->SetParam("fmax") must be called if joint->SetAngle() or joint->SetParam("vel") are
+            // going to be called. joint->SetParam("fmax") must *not* be called if joint->SetForce() is
+            // going to be called.
+    #if GAZEBO_MAJOR_VERSION > 2
+            joint->handle->SetParam("fmax", 0, joint->joint_effort_limit);
+    #else
+            joint->handle->SetMaxForce(0, joint->joint_effort_limit);
+    #endif
+          }
+
           continue;
         }
       }
@@ -152,6 +199,7 @@ bool FrankaHWSim::initSim(const std::string& robot_namespace,
   registerInterface(&this->jsi_);
   registerInterface(&this->fsi_);
   registerInterface(&this->fmi_);
+  registerInterface(&this->vji_);
 
   // Initialize ROS Services
   initServices(model_nh);
@@ -311,26 +359,70 @@ void FrankaHWSim::readSim(ros::Time time, ros::Duration period) {
   this->updateRobotState(time);
 }
 
-void FrankaHWSim::writeSim(ros::Time /*time*/, ros::Duration /*period*/) {
+void FrankaHWSim::writeSim(ros::Time /*time*/, ros::Duration period) {
   auto g = this->model_->gravity(this->robot_state_, this->gravity_earth_);
-
+  
   for (auto& pair : this->joints_) {
     auto joint = pair.second;
     auto command = joint->command;
+    switch (joint->joint_control_method) {
+      case EFFORT: {
+        // Check if this joint is affected by gravity compensation
+        std::string prefix = this->arm_id_ + "_joint";
+        if (pair.first.rfind(prefix, 0) != std::string::npos) {
+          int i = std::stoi(pair.first.substr(prefix.size())) - 1;
+          command += g.at(i);
+        }
 
-    // Check if this joint is affected by gravity compensation
-    std::string prefix = this->arm_id_ + "_joint";
-    if (pair.first.rfind(prefix, 0) != std::string::npos) {
-      int i = std::stoi(pair.first.substr(prefix.size())) - 1;
-      command += g.at(i);
-    }
+        if (std::isnan(command)) {
+          ROS_WARN_STREAM_NAMED("franka_hw_sim",
+                                "Command for " << joint->name << "is NaN, won't send to robot");
+          continue;
+        }
+        joint->handle->SetForce(0, command);
+      }
+      break;
 
-    if (std::isnan(command)) {
-      ROS_WARN_STREAM_NAMED("franka_hw_sim",
-                            "Command for " << joint->name << "is NaN, won't send to robot");
-      continue;
+      /**
+        add the case when the joint uses VelocityJointInterface (no pid gains specified)
+        @see
+        http://gazebosim.org/tutorials?tut=set_velocity&cat=
+      */
+
+      case VELOCITY: {
+
+#if GAZEBO_MAJOR_VERSION > 2
+        if (physics_type_.compare("dart") == 0)
+        {
+          joint->handle->SetVelocity(0, joint->command);
+        }
+        else
+        {
+          joint->handle->SetParam("vel", 0, joint->command);
+        }
+#else
+        joint->handle->SetVelocity(0, joint->command);
+#endif
+      }
+      break;
+
+      /**
+      add the case when there are pid gains specified for the joint (in spawn_albert.launch for now as how boxer_gazebo/spawn_boxer.launch does)
+      @see
+      https://github.com/ros-simulation/gazebo_ros_pkgs/issues/886
+      */
+      case VELOCITY_PID: {
+        double error;
+        error = joint->command - joint->velocity;
+        const double effort_limit = joint->joint_effort_limit;
+        const double effort = boost::algorithm::clamp(joint->pid_controller.computeCommand(error, period),
+                                    -effort_limit, effort_limit);
+        joint->handle->SetForce(0, effort);
+      }
+      break;
+
+
     }
-    joint->handle->SetForce(0, command);
   }
 }
 
@@ -518,6 +610,116 @@ void FrankaHWSim::updateRobotState(ros::Time time) {
   this->robot_state_.control_command_success_rate = 1.0;
   this->robot_state_.time = franka::Duration(time.toNSec() / 1e6 /*ms*/);
   this->robot_state_.O_T_EE = this->model_->pose(franka::Frame::kEndEffector, this->robot_state_);
+}
+
+// taken from the default robot hw sim (removed the POSITION case)
+
+// Register the limits of the joint specified by joint_name and joint_handle. The limits are
+// retrieved from joint_limit_nh. If urdf_model is not NULL, limits are retrieved from it also.
+// Return the joint's type, lower position limit, upper position limit, and effort limit.
+void FrankaHWSim::registerJointLimits(const std::string& joint_name,
+                         const hardware_interface::JointHandle& joint_handle,
+                         const ControlMethod ctrl_method,
+                         const ros::NodeHandle& joint_limit_nh,
+                         const urdf::Model *const urdf_model,
+                         int *const joint_type, double *const lower_limit,
+                         double *const upper_limit, double *const effort_limit)
+{
+  *joint_type = urdf::Joint::UNKNOWN;
+  *lower_limit = -std::numeric_limits<double>::max();
+  *upper_limit = std::numeric_limits<double>::max();
+  *effort_limit = std::numeric_limits<double>::max();
+
+  joint_limits_interface::JointLimits limits;
+  bool has_limits = false;
+  joint_limits_interface::SoftJointLimits soft_limits;
+  bool has_soft_limits = false;
+
+  if (urdf_model != NULL)
+  {
+    const urdf::JointConstSharedPtr urdf_joint = urdf_model->getJoint(joint_name);
+    if (urdf_joint != NULL)
+    {
+      *joint_type = urdf_joint->type;
+      // Get limits from the URDF file.
+      if (joint_limits_interface::getJointLimits(urdf_joint, limits))
+        has_limits = true;
+      if (joint_limits_interface::getSoftJointLimits(urdf_joint, soft_limits))
+        has_soft_limits = true;
+    }
+  }
+  // Get limits from the parameter server.
+  if (joint_limits_interface::getJointLimits(joint_name, joint_limit_nh, limits))
+    has_limits = true;
+
+  if (!has_limits)
+    return;
+
+  if (*joint_type == urdf::Joint::UNKNOWN)
+  {
+    // Infer the joint type.
+
+    if (limits.has_position_limits)
+    {
+      *joint_type = urdf::Joint::REVOLUTE;
+    }
+    else
+    {
+      if (limits.angle_wraparound)
+        *joint_type = urdf::Joint::CONTINUOUS;
+      else
+        *joint_type = urdf::Joint::PRISMATIC;
+    }
+  }
+
+  if (limits.has_position_limits)
+  {
+    *lower_limit = limits.min_position;
+    *upper_limit = limits.max_position;
+  }
+  if (limits.has_effort_limits)
+    *effort_limit = limits.max_effort;
+
+  if (has_soft_limits)
+  {
+    switch (ctrl_method)
+    {
+      case EFFORT:
+        {
+          const joint_limits_interface::EffortJointSoftLimitsHandle
+            limits_handle(joint_handle, limits, soft_limits);
+          ej_limits_interface_.registerHandle(limits_handle);
+        }
+        break;
+      case VELOCITY:
+        {
+          const joint_limits_interface::VelocityJointSoftLimitsHandle
+            limits_handle(joint_handle, limits, soft_limits);
+          vj_limits_interface_.registerHandle(limits_handle);
+        }
+        break;
+    }
+  }
+  else
+  {
+    switch (ctrl_method)
+    {
+      case EFFORT:
+        {
+          const joint_limits_interface::EffortJointSaturationHandle
+            sat_handle(joint_handle, limits);
+          ej_sat_interface_.registerHandle(sat_handle);
+        }
+        break;
+      case VELOCITY:
+        {
+          const joint_limits_interface::VelocityJointSaturationHandle
+            sat_handle(joint_handle, limits);
+          vj_sat_interface_.registerHandle(sat_handle);
+        }
+        break;
+    }
+  }
 }
 
 }  // namespace franka_gazebo

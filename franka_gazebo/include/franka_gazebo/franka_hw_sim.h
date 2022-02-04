@@ -18,6 +18,11 @@
 #include <map>
 #include <memory>
 
+#include <joint_limits_interface/joint_limits.h>
+#include <joint_limits_interface/joint_limits_interface.h>
+#include <joint_limits_interface/joint_limits_rosparam.h>
+#include <joint_limits_interface/joint_limits_urdf.h>
+
 namespace franka_gazebo {
 
 /**
@@ -98,6 +103,9 @@ class FrankaHWSim : public gazebo_ros_control::RobotHWSim {
 
   hardware_interface::JointStateInterface jsi_;
   hardware_interface::EffortJointInterface eji_;
+  // add velocity joint interface
+  hardware_interface::VelocityJointInterface vji_;
+
   franka_hw::FrankaStateInterface fsi_;
   franka_hw::FrankaModelInterface fmi_;
 
@@ -129,6 +137,26 @@ class FrankaHWSim : public gazebo_ros_control::RobotHWSim {
   bool readParameters(const ros::NodeHandle& nh, const urdf::Model& urdf);
 
   void guessEndEffector(const ros::NodeHandle& nh, const urdf::Model& urdf);
+
+
+  // Register the limits of the joint specified by joint_name and joint_handle. The limits are
+  // retrieved from joint_limit_nh. If urdf_model is not NULL, limits are retrieved from it also.
+  // Return the joint's type, lower position limit, upper position limit, and effort limit.
+  void registerJointLimits(const std::string& joint_name,
+                           const hardware_interface::JointHandle& joint_handle,
+                           const ControlMethod ctrl_method,
+                           const ros::NodeHandle& joint_limit_nh,
+                           const urdf::Model *const urdf_model,
+                           int *const joint_type, double *const lower_limit,
+                           double *const upper_limit, double *const effort_limit);
+
+
+  joint_limits_interface::EffortJointSaturationInterface   ej_sat_interface_;
+  joint_limits_interface::EffortJointSoftLimitsInterface   ej_limits_interface_;
+  joint_limits_interface::VelocityJointSaturationInterface vj_sat_interface_;
+  joint_limits_interface::VelocityJointSoftLimitsInterface vj_limits_interface_;
+
+  std::string physics_type_;
 
   template <int N>
   std::array<double, N> readArray(std::string param, std::string name = "") {
